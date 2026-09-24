@@ -12,27 +12,24 @@ on Streamlit Cloud or any other server.
 ## Layout
 
 ```
-<this repo>/
-  demo_dashboard/         the dashboard (Streamlit) + the tracking/extraction scripts
-  eye_contact_portable/   standalone eye-contact detector + its calibration routine
-  patches/                changes + requirements for the third-party iris demo (see below)
-  MediaPipe-Iris/         NOT in this repo - clone it here yourself (step 1)
+demo_dashboard/         the dashboard (Streamlit) + the tracking/extraction scripts
+eye_contact_portable/   standalone eye-contact detector + its calibration routine
+iris_tracker/           the iris-tracking engine the dashboard runs (demo.py + models)
 ```
 
 ## Setup
 
-1. **Iris tracker** (third-party, not redistributed here):
+1. **Iris tracker environment** - `iris_tracker/` needs its own virtual environment
+   (it uses the legacy MediaPipe API, which cannot share the dashboard's):
 
    ```
-   git clone https://github.com/noorkhokhar99/MediaPipe-Iris.git
-   cd MediaPipe-Iris
-   git apply ../patches/demo.py.patch          # per-eye tracking + gaze calibration used by the dashboard
-   python -m venv .venv && .venv\Scripts\pip install -r ../patches/mediapipe-iris-requirements.txt
+   cd iris_tracker
+   python -m venv .venv
+   .venv\Scripts\pip install -r requirements.txt
    cd ..
    ```
 
-   The dashboard runs the tracking scripts with **this** `.venv` (it needs the legacy MediaPipe API).
-   Set `DEMO_DIR` / `EC_DIR` if you put the folders somewhere else.
+   The dashboard finds it automatically. Set `DEMO_DIR` / `EC_DIR` to move the folders.
 
 2. **Face landmarker model** - nothing to do: `eye_contact.py` downloads
    `face_landmarker.task` (3.6 MB, Google) into `eye_contact_portable/` on first run.
