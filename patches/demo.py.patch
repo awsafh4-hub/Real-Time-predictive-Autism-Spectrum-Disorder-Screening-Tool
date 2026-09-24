@@ -1,0 +1,416 @@
+diff --git a/demo.py b/demo.py
+index 8744ed7..5e7bcd4 100644
+--- a/demo.py
++++ b/demo.py
+@@ -2,6 +2,9 @@
+ # -*- coding: utf-8 -*-
+ import copy
+ import argparse
++import json
++import math
++import time
+ 
+ import cv2 as cv
+ import numpy as np
+@@ -25,8 +28,26 @@ def get_args():
+                         default=0.7)
+     parser.add_argument("--min_tracking_confidence",
+                         help='min_tracking_confidence',
+-                        type=int,
++                        type=float,
+                         default=0.7)
++    parser.add_argument("--gaze-test", action="store_true",
++                        help='show experimental gaze and eye-contact overlay')
++    # A calibrated LEFT/RIGHT/UP/DOWN target reads as 15 deg, so a threshold of
++    # 15 puts the target itself on the edge and looking there flickers between
++    # contact and away. 10 keeps a margin; pass 15 to get the old behaviour.
++    parser.add_argument("--eye-contact-threshold", type=float, default=10.0,
++                        help='approximate eye-contact angle threshold in degrees')
++    parser.add_argument("--vertical-eye-contact-threshold", type=float,
++                        default=10.0,
++                        help='vertical threshold; ignored if calibration is weak')
++    parser.add_argument("--eye-contact-frames", type=int, default=5,
++                        help='consecutive frames required for eye contact')
++    parser.add_argument("--calibrate", action="store_true",
++                        help='run five-point gaze calibration before testing')
++    parser.add_argument("--calibration-file", default='gaze_calibration.json',
++                        help='calibration file path')
++    parser.add_argument("--fullscreen", action="store_true",
++                        help='display the camera window fullscreen')
+ 
+     args = parser.parse_args()
+ 
+@@ -44,6 +65,16 @@ def main():
+     max_num_faces = args.max_num_faces
+     min_detection_confidence = args.min_detection_confidence
+     min_tracking_confidence = args.min_tracking_confidence
++    gaze_test = args.gaze_test
++    eye_contact_threshold = args.eye_contact_threshold
++    vertical_eye_contact_threshold = args.vertical_eye_contact_threshold
++    calibration = None if args.calibrate else load_calibration(
++        args.calibration_file)
++    calibration_targets = ('CENTER', 'LEFT', 'RIGHT', 'UP', 'DOWN')
++    calibration_samples = {target: [] for target in calibration_targets}
++    calibration_index = 0
++    calibration_started = time.monotonic()
++    fullscreen = args.fullscreen or args.calibrate
+ 
+     # Camera preparation ################################################ ################
+     cap = cv.VideoCapture(cap_device)
+@@ -60,6 +91,14 @@ def main():
+ 
+     # FPS Measurement Module ############################################### ##########
+     cvFpsCalc = CvFpsCalc(buffer_len=10)
++    last_gaze_log = 0.0
++    smoothed_ratio = None
++    eye_contact_frames = 0
++    window_name = 'Iris(tflite) Demo'
++    cv.namedWindow(window_name, cv.WINDOW_NORMAL)
++    if fullscreen:
++        cv.setWindowProperty(window_name, cv.WND_PROP_FULLSCREEN,
++                             cv.WINDOW_FULLSCREEN)
+ 
+     while True:
+         display_fps = cvFpsCalc.get()
+@@ -97,6 +136,59 @@ def main():
+                 right_radius,
+             )
+ 
++            if gaze_test or (args.calibrate and
++                             calibration_index < len(calibration_targets)):
++                gaze_info = calculate_gaze_info(
++                    left_eye, right_eye, left_center, right_center,
++                    eye_contact_threshold, calibration,
++                    vertical_eye_contact_threshold)
++                smoothed_ratio = smooth_ratio(
++                    smoothed_ratio, gaze_info['raw_ratio_x'],
++                    gaze_info['raw_ratio_y'])
++                gaze_info = apply_ratio_to_gaze_info(
++                    gaze_info, smoothed_ratio, calibration,
++                    eye_contact_threshold, vertical_eye_contact_threshold)
++                if gaze_info['eye_contact']:
++                    eye_contact_frames += 1
++                else:
++                    eye_contact_frames = 0
++                gaze_info['eye_contact'] = (
++                    eye_contact_frames >= args.eye_contact_frames)
++
++                if gaze_test and (not args.calibrate or
++                                  calibration_index >= len(calibration_targets)):
++                    debug_image = draw_gaze_overlay(debug_image, gaze_info)
++
++                now = time.monotonic()
++                if (now - last_gaze_log >= 0.25 and
++                    not (args.calibrate and
++                         calibration_index < len(calibration_targets))):
++                    print(
++                        'iris_ratio x={:.3f} y={:.3f} | gaze angle '
++                        'x={:.1f} y={:.1f} deg | eye contact={}'.format(
++                            gaze_info['ratio_x'], gaze_info['ratio_y'],
++                            gaze_info['angle_x'], gaze_info['angle_y'],
++                            gaze_info['eye_contact']))
++                    last_gaze_log = now
++
++            if args.calibrate and calibration_index < len(calibration_targets):
++                target = calibration_targets[calibration_index]
++                elapsed = time.monotonic() - calibration_started
++                if elapsed >= 1.0:
++                    calibration_samples[target].append(
++                        (gaze_info['raw_ratio_x'], gaze_info['raw_ratio_y']))
++                if elapsed >= 4.0:
++                    calibration_index += 1
++                    calibration_started = time.monotonic()
++                    if calibration_index == len(calibration_targets):
++                        calibration = build_calibration(calibration_samples)
++                        save_calibration(args.calibration_file, calibration)
++                        eye_contact_frames = 0
++                        print('Calibration saved to {}'.format(
++                            args.calibration_file))
++                debug_image = draw_calibration_target(
++                    debug_image, target, elapsed)
++
+         cv.putText(debug_image, "FPS:" + str(display_fps), (10, 30),
+                    cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv.LINE_AA)
+ 
+@@ -106,7 +198,7 @@ def main():
+             break
+ 
+         # Screen reflection ################################################# ###############
+-        cv.imshow('Iris(tflite) Demo', debug_image)
++        cv.imshow(window_name, debug_image)
+ 
+     cap.release()
+     cv.destroyAllWindows()
+@@ -150,12 +242,12 @@ def detect_iris(image, iris_detector, left_eye, right_eye):
+ def calc_iris_point(eye_bbox, eye_contour, iris, input_shape):
+     iris_list = []
+     for index in range(5):
+-        point_x = int(iris[index * 3] *
+-                      ((eye_bbox[2] - eye_bbox[0]) / input_shape[0]))
+-        point_y = int(iris[index * 3 + 1] *
+-                      ((eye_bbox[3] - eye_bbox[1]) / input_shape[1]))
++        point_x = iris[index * 3] * ((eye_bbox[2] - eye_bbox[0]) /
++                         input_shape[0])
++        point_y = iris[index * 3 + 1] * ((eye_bbox[3] - eye_bbox[1]) /
++                         input_shape[1])
+         point_x += eye_bbox[0]
+-        dot_y += eye_bbox[1]
++        point_y += eye_bbox[1]
+ 
+         iris_list.append((point_x, point_y))
+ 
+@@ -163,13 +255,210 @@ def calc_iris_point(eye_bbox, eye_contour, iris, input_shape):
+ 
+ 
+ def calc_min_enc_losingCircle(landmark_list):
+-    center, radius = cv.minEnclosingCircle(np.array(landmark_list))
+-    center = (int(center[0]), int(center[1]))
+-    radius = int(radius)
++    landmarks = np.asarray(landmark_list, dtype=np.float32)
++    center, radius = cv.minEnclosingCircle(landmarks)
++    center = (float(center[0]), float(center[1]))
++    radius = float(radius)
+ 
+     return center, radius
+ 
+ 
++def load_calibration(path):
++    try:
++        with open(path, 'r', encoding='utf-8') as calibration_file:
++            return json.load(calibration_file)
++    except (FileNotFoundError, json.JSONDecodeError):
++        return None
++
++
++def save_calibration(path, calibration):
++    with open(path, 'w', encoding='utf-8') as calibration_file:
++        json.dump(calibration, calibration_file, indent=2)
++
++
++def build_calibration(samples):
++    means = {}
++    for target, values in samples.items():
++        if not values:
++            raise RuntimeError('No samples collected for {}'.format(target))
++        means[target] = [
++            sum(value[axis] for value in values) / len(values)
++            for axis in (0, 1)
++        ]
++    center = means['CENTER']
++    horizontal_scale = (
++        abs(means['LEFT'][0] - center[0]) +
++        abs(means['RIGHT'][0] - center[0])) / 2
++    vertical_scale = (
++        abs(means['UP'][1] - center[1]) +
++        abs(means['DOWN'][1] - center[1])) / 2
++
++    # Per-side scales: one shared scale under-reads the weaker side (camera
++    # off-centre, head turned during calibration), so looking that way could
++    # never reach the eye-contact threshold. Only trusted when each target
++    # moved the iris the expected way (LEFT/UP negative, RIGHT/DOWN positive).
++    def side_scales(neg_key, pos_key, axis, shared):
++        neg = means[neg_key][axis] - center[axis]
++        pos = means[pos_key][axis] - center[axis]
++        if neg >= 0 or pos <= 0:
++            return None, None
++        floor = 0.5 * shared    # stop one noisy side from over-amplifying
++        return max(-neg, floor), max(pos, floor)
++
++    left_scale, right_scale = side_scales(
++        'LEFT', 'RIGHT', 0, horizontal_scale)
++    up_scale, down_scale = side_scales(
++        'UP', 'DOWN', 1, vertical_scale)
++    return {
++        'means': means,
++        'center': center,
++        'horizontal_scale': horizontal_scale,
++        'vertical_scale': vertical_scale,
++        'vertical_valid': vertical_scale >= 0.03,
++        'left_scale': left_scale,
++        'right_scale': right_scale,
++        'up_scale': up_scale,
++        'down_scale': down_scale,
++    }
++
++
++def scaled_angle(delta, calibration, axis):
++    """15 deg == the calibrated target on the side the iris moved toward.
++
++    Calibration files saved before per-side scales existed only have the
++    shared horizontal_scale / vertical_scale, so fall back to those.
++    """
++    if axis == 'x':
++        neg_key, pos_key, shared_key = 'left_scale', 'right_scale', 'horizontal_scale'
++    else:
++        neg_key, pos_key, shared_key = 'up_scale', 'down_scale', 'vertical_scale'
++    scale = calibration.get(neg_key if delta < 0 else pos_key)
++    return 15.0 * delta / (scale or calibration[shared_key])
++
++
++def calculate_gaze_info(left_eye, right_eye, left_center, right_center,
++                        threshold_degrees, calibration=None,
++                        vertical_threshold_degrees=30.0):
++    eye_centers = [
++        ((left_eye[0] + left_eye[2]) / 2,
++         (left_eye[1] + left_eye[3]) / 2),
++        ((right_eye[0] + right_eye[2]) / 2,
++         (right_eye[1] + right_eye[3]) / 2),
++    ]
++    iris_centers = [left_center, right_center]
++    ratios = []
++
++    for eye_center, iris_center, eye_bbox in zip(
++            eye_centers, iris_centers, (left_eye, right_eye)):
++        half_width = max((eye_bbox[2] - eye_bbox[0]) / 2, 1)
++        ratios.append(((iris_center[0] - eye_center[0]) / half_width,
++                   (iris_center[1] - eye_center[1]) / half_width))
++
++    ratio_x = sum(ratio[0] for ratio in ratios) / len(ratios)
++    ratio_y = sum(ratio[1] for ratio in ratios) / len(ratios)
++    raw_ratio_x = ratio_x
++    raw_ratio_y = ratio_y
++    if calibration:
++        ratio_x -= calibration['center'][0]
++        ratio_y -= calibration['center'][1]
++        angle_x = scaled_angle(ratio_x, calibration, 'x')
++        angle_y = (scaled_angle(ratio_y, calibration, 'y')
++                   if calibration.get('vertical_valid', False) else 0.0)
++    else:
++        angle_x = math.degrees(math.atan2(ratio_x, 2.0))
++        angle_y = math.degrees(math.atan2(ratio_y, 2.0))
++
++    return {
++        'ratio_x': ratio_x,
++        'ratio_y': ratio_y,
++        'raw_ratio_x': raw_ratio_x,
++        'raw_ratio_y': raw_ratio_y,
++        'angle_x': angle_x,
++        'angle_y': angle_y,
++        'threshold': threshold_degrees,
++        'eye_contact': (abs(angle_x) <= threshold_degrees and
++                (not calibration or
++                 not calibration.get('vertical_valid', False) or
++                 abs(angle_y) <= vertical_threshold_degrees)),
++        'center': (
++            int((left_center[0] + right_center[0]) / 2),
++            int((left_center[1] + right_center[1]) / 2)),
++    }
++
++
++def smooth_ratio(previous, ratio_x, ratio_y, alpha=0.25):
++    if previous is None:
++        return ratio_x, ratio_y
++    return (
++        previous[0] + alpha * (ratio_x - previous[0]),
++        previous[1] + alpha * (ratio_y - previous[1]),
++    )
++
++
++def apply_ratio_to_gaze_info(gaze_info, ratio, calibration,
++                             threshold_degrees, vertical_threshold_degrees):
++    raw_ratio_x, raw_ratio_y = gaze_info['raw_ratio_x'], gaze_info['raw_ratio_y']
++    ratio_x, ratio_y = ratio
++    if calibration:
++        ratio_x -= calibration['center'][0]
++        ratio_y -= calibration['center'][1]
++        angle_x = scaled_angle(ratio_x, calibration, 'x')
++        angle_y = (scaled_angle(ratio_y, calibration, 'y')
++                   if calibration.get('vertical_valid', False) else 0.0)
++        vertical_ok = (not calibration.get('vertical_valid', False) or
++                        abs(angle_y) <= vertical_threshold_degrees)
++    else:
++        angle_x = math.degrees(math.atan2(ratio_x, 2.0))
++        angle_y = math.degrees(math.atan2(ratio_y, 2.0))
++        vertical_ok = abs(angle_y) <= vertical_threshold_degrees
++    gaze_info.update({
++        'ratio_x': ratio_x,
++        'ratio_y': ratio_y,
++        'angle_x': angle_x,
++        'angle_y': angle_y,
++        'threshold': threshold_degrees,
++        'eye_contact': abs(angle_x) <= threshold_degrees and vertical_ok,
++    })
++    return gaze_info
++
++
++def draw_calibration_target(debug_image, target, elapsed):
++    height, width = debug_image.shape[:2]
++    positions = {
++        'CENTER': (width // 2, height // 2),
++        'LEFT': (width // 5, height // 2),
++        'RIGHT': (width * 4 // 5, height // 2),
++        'UP': (width // 2, height // 5),
++        'DOWN': (width // 2, height * 4 // 5),
++    }
++    point = positions[target]
++    cv.circle(debug_image, point, 14, (0, 255, 255), -1)
++    cv.putText(debug_image, 'Look at {} ({:.1f}/4.0s)'.format(
++        target, min(elapsed, 4.0)), (10, 115), cv.FONT_HERSHEY_SIMPLEX,
++        0.8, (0, 255, 255), 2, cv.LINE_AA)
++    return debug_image
++
++
++def draw_gaze_overlay(debug_image, gaze_info):
++    center = (int(gaze_info['center'][0]), int(gaze_info['center'][1]))
++    end = (center[0] + int(gaze_info['ratio_x'] * 80),
++           center[1] + int(gaze_info['ratio_y'] * 80))
++    color = (0, 255, 0) if gaze_info['eye_contact'] else (0, 255, 255)
++    cv.arrowedLine(debug_image, center, end, color, 2, cv.LINE_AA, 0, 0.2)
++
++    status = ('EYE CONTACT ~{:.0f}deg'.format(gaze_info['threshold'])
++              if gaze_info['eye_contact'] else 'LOOK AWAY')
++    cv.putText(debug_image, status, (10, 58), cv.FONT_HERSHEY_SIMPLEX,
++               0.7, color, 2, cv.LINE_AA)
++    cv.putText(debug_image,
++               'ratio x:{:.2f} y:{:.2f}  angle x:{:.1f} y:{:.1f}'.format(
++                   gaze_info['ratio_x'], gaze_info['ratio_y'],
++                   gaze_info['angle_x'], gaze_info['angle_y']),
++               (10, 84), cv.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv.LINE_AA)
++
++    return debug_image
++
++
+ def draw_debug_image(
+     debug_image,
+     left_iris,
+@@ -180,14 +469,20 @@ def draw_debug_image(
+     right_radius,
+ ):
+     # Rainbow: circumscribed yen
++    left_center = (int(left_center[0]), int(left_center[1]))
++    right_center = (int(right_center[0]), int(right_center[1]))
++    left_radius = int(left_radius)
++    right_radius = int(right_radius)
+     cv.circle(debug_image, left_center, left_radius, (0, 255, 0), 2)
+     cv.circle(debug_image, right_center, right_radius, (0, 255, 0), 2)
+ 
+     # iris: landmark
+     for point in left_iris:
+-        cv.circle(debug_image, (point[0], point[1]), 1, (0, 0, 255), 2)
++        cv.circle(debug_image, (int(point[0]), int(point[1])), 1,
++              (0, 0, 255), 2)
+     for point in right_iris:
+-        cv.circle(debug_image, (point[0], point[1]), 1, (0, 0, 255), 2)
++        cv.circle(debug_image, (int(point[0]), int(point[1])), 1,
++              (0, 0, 255), 2)
+ 
+     # iridescence: radius
+     cv.putText(debug_image, 'r:' + str(left_radius) + 'px',
+@@ -199,6 +494,17 @@ def draw_debug_image(
+                 right_center[1] + int(right_radius * 0.5)),
+                cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
+ 
++    cv.putText(debug_image, 'x:' + str(left_center[0]) +
++               ' y:' + str(left_center[1]),
++               (left_center[0] + 10, left_center[1] - 10),
++               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1,
++               cv.LINE_AA)
++    cv.putText(debug_image, 'x:' + str(right_center[0]) +
++               ' y:' + str(right_center[1]),
++               (right_center[0] + 10, right_center[1] - 10),
++               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1,
++               cv.LINE_AA)
++
+     return debug_image
+ 
+ 
